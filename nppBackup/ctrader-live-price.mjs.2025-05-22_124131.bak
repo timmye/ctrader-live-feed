@@ -1,0 +1,138 @@
+import tls from 'tls';
+import fs from 'fs';
+import path from 'path';
+import dotenv from 'dotenv';
+import fetch from 'node-fetch';
+import { loadPackageDefinition } from '@grpc/grpc-js';
+import { loadSync } from '@grpc/proto-loader';
+import grpc from '@grpc/grpc-js';
+
+dotenv.config();
+
+const PROTO_DIR = path.resolve('./protos');
+const HOST = 'live.ctraderapi.com';
+const PORT = 5035;
+
+// Load all required proto files
+const packageDefinition = loadSync([
+  path.join(PROTO_DIR, 'OpenApiCommonMessages.proto'),
+  path.join(PROTO_DIR, 'OpenApiCommonModelMessages.proto'),
+  path.join(PROTO_DIR, 'OpenApiMessages.proto'),
+  path.join(PROTO_DIR, 'OpenApiModelMessages.proto'),
+], {
+  keepCase: false,
+  longs: String,
+  enums: String,
+  defaults: true,
+  oneofs: true
+});
+
+const proto = loadPackageDefinition(packageDefinition).proto;
+
+const client = new proto.OpenApiService(
+  `${HOST}:${PORT}`,
+  grpc.credentials.createSsl()
+);
+
+// Utility: save updated tokens to .env file
+function saveTokensToEnv(accessToken, refreshToken) {
+  const envPath = path.resolve('.env');
+  const envData = fs.readFileSync(envPath, 'utf-8').split('\n');
+  const updated = envData.map(line => {
+    if (line.startsWith('CTRADER_ACCESS_TOKEN=')) return `CTRADER_ACCESS_TOKEN=${accessToken}`;
+    if (line.startsWith('CTRADER_REFRESH_TOKEN=')) return `CTRADER_REFRESH_TOKEN=${refreshToken}`;
+    return line;
+  });
+  fs.writeFileSync(envPath, updated.join('\n'), 'utf-8');
+}
+
+// OAuth2 refresh token logic
+async function refreshToken() {
+  const res = await fetch('https://connect.spotware.com/connect/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: process.env.CTRADER_REFRESH_TOKEN,
+      client_id: process.env.CTRADER_CLIENT_ID,
+      client_secret: process.env.CTRADER_CLIENT_SECRET,
+      redirect_uri: process.env.CTRADER_REDIRECT_URI
+    }).toString()
+  });
+
+  const data = await res.json();
+  if (!data.access_token) throw new Error('Failed to refresh token');
+
+  saveTokensToEnv(data.access_token, data.refresh_token);
+  process.env.CTRADER_ACCESS_TOKEN = data.access_token;
+  process.env.CTRADER_REFRESH_TOKEN = data.refresh_token;
+  console.log('🔁 Refreshed access token');
+}
+
+async function main() {
+  if (!process.env.CTRADER_ACCESS_TOKEN) {
+    console.error('❌ Missing CTRADER_ACCESS_TOKEN in .env');
+    process.exit(1);
+  }
+
+  console.log('🔗 Connecting to cTrader Open API...');
+
+  // 1. Version handshake
+  client.ProtoOAVersionService({ version: '1.0' }, (err, res) => {
+    if (err) return console.error('❌ Version error:', err);
+    console.log('📡 Version handshake complete');
+
+    // 2. Application auth
+    client.ProtoOAApplicationAuthReq({
+      clientId: process.env.CTRADER_CLIENT_ID,
+      clientSecret: process.env.CTRADER_CLIENT_SECRET
+    }, (err, res) => {
+      if (err) return console.error('❌ App auth error:', err);
+      console.log('✅ Application authenticated');
+
+      // 3. Account auth
+      client.ProtoOAAccountAuthReq({
+        accessToken: process.env.CTRADER_ACCESS_TOKEN,
+        ctidTraderAccountId: parseInt(process.env.CTRADER_ACCOUNT_ID)
+      }, (err, res) => {
+        if (err) {
+          console.error('❌ Account auth error:', err.message);
+          if (err.message.includes('CANT_ROUTE_REQUEST')) {
+            console.error('🔁 Attempting token refresh...');
+            refreshToken().then(() => {
+              console.log('🔄 Restart the script to use refreshed token.');
+              process.exit(1);
+            });
+          }
+          return;
+        }
+
+        console.log('🧑‍💼 Account authenticated');
+        startTickStream(); // Starts price stream after auth
+      });
+    });
+  });
+}
+
+// 4. Tick Stream (clearly separated)
+function startTickStream() {
+  console.log('📶 Starting tick stream...');
+  const symbolId = 1; // Update this to actual symbol ID (e.g. EURUSD = 1)
+  client.ProtoOASubscribeSpotsReq({
+    ctidTraderAccountId: parseInt(process.env.CTRADER_ACCOUNT_ID),
+    symbolId
+  }, (err, res) => {
+    if (err) return console.error('❌ SubscribeSpots error:', err.message);
+    console.log(`📈 Subscribed to symbol ${symbolId}`);
+  });
+
+  const stream = client.ProtoOASpotEvent({});
+  stream.on('data', (tick) => {
+    console.log(`[${tick.symbolName}] Bid: ${tick.bidPrice} / Ask: ${tick.askPrice}`);
+  });
+
+  stream.on('error', (err) => console.error('📉 Stream error:', err));
+  stream.on('end', () => console.log('📴 Stream ended'));
+}
+
+main();

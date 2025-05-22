@@ -1,0 +1,317 @@
+import net from 'net';
+import fs from 'fs';
+import readline from 'readline';
+import path from 'path';
+import axios from 'axios';
+import dotenv from 'dotenv';
+import ProtoLoader from '@grpc/proto-loader';
+import grpc from '@grpc/grpc-js';
+
+// --- Setup and load env ---
+
+const envPath = path.resolve(process.cwd(), '.env');
+dotenv.config({ path: envPath });
+
+let {
+  CTRADER_CLIENT_ID,
+  CTRADER_CLIENT_SECRET,
+  CTRADER_ACCESS_TOKEN,
+  CTRADER_REFRESH_TOKEN,
+  CTRADER_ACCOUNT_ID,
+  CTRADER_TOKEN_EXPIRES_AT
+} = process.env;
+
+const PROTOS_PATH = path.resolve(process.cwd(), 'protos');
+const OPENAPI_PROTO = path.join(PROTOS_PATH, 'OpenApiMessages.proto');
+const COMMON_MODEL_PROTO = path.join(PROTOS_PATH, 'OpenApiCommonModelMessages.proto');
+const COMMON_PROTO = path.join(PROTOS_PATH, 'OpenApiCommonMessages.proto');
+
+// --- Load protobuf definitions ---
+
+const packageDefinition = protoLoader.loadSync(
+  ['./protos/OpenApiMessages.proto', './protos/OpenApiCommonMessages.proto', './protos/OpenApiCommonModelMessages.proto'],
+  {
+    keepCase: true,
+    longs: String,
+    enums: String,
+    defaults: true,
+    oneofs: true,
+  }
+);
+
+const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
+
+// Check your package structure here
+console.log(JSON.stringify(protoDescriptor, null, 2));
+
+
+// Extract message types
+const OpenApiMessages = protoDescriptor.OpenApiMessages;
+const OpenApiCommonModelMessages = protoDescriptor.OpenApiCommonModelMessages;
+const OpenApiCommonMessages = protoDescriptor.OpenApiCommonMessages;
+
+// Define helper maps for message types and payload types
+const MessageTypes = {
+  AuthenticateRequest: OpenApiMessages.AuthenticateRequest,
+  StreamingCreateSessionRequest: OpenApiMessages.StreamingCreateSessionRequest,
+  StreamingSessionStatusNotification: OpenApiMessages.StreamingSessionStatusNotification,
+  SubscriptionStreamingMarketDataRequest: OpenApiMessages.SubscriptionStreamingMarketDataRequest,
+  // Add more as needed
+};
+
+const PayloadType = OpenApiCommonMessages.StreamingMessagePayloadType;
+
+const payloadTypeMap = {
+  AuthenticateRequest: PayloadType.AuthenticateRequest,
+  StreamingCreateSessionRequest: PayloadType.StreamingCreateSessionRequest,
+  SubscriptionStreamingMarketDataRequest: PayloadType.SubscriptionStreamingMarketDataRequest,
+  // Add more as needed
+};
+
+// --- Token refresh and env update ---
+
+async function refreshAccessToken() {
+  try {
+    const url = 'https://oauth.ctraderapi.com/token';
+    const params = new URLSearchParams({
+      client_id: CTRADER_CLIENT_ID,
+      client_secret: CTRADER_CLIENT_SECRET,
+      grant_type: 'refresh_token',
+      refresh_token: CTRADER_REFRESH_TOKEN,
+      scope: 'openid',
+    });
+
+    const response = await axios.post(url, params, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+
+    const data = response.data;
+
+    CTRADER_ACCESS_TOKEN = data.access_token;
+    CTRADER_REFRESH_TOKEN = data.refresh_token;
+    CTRADER_TOKEN_EXPIRES_AT = Date.now() + (data.expires_in * 1000) - (60 * 1000); // 1 minute buffer
+
+    // Update .env atomically
+    updateEnv({
+      CTRADER_ACCESS_TOKEN,
+      CTRADER_REFRESH_TOKEN,
+      CTRADER_TOKEN_EXPIRES_AT,
+    });
+
+    console.log(`✅ Access token refreshed, expires in ${data.expires_in} seconds`);
+
+  } catch (error) {
+    console.error('❌ Token refresh failed:', error.response?.data || error.message);
+    process.exit(1); // Can't proceed without token
+  }
+}
+
+function updateEnv(updates) {
+  const envLines = fs.readFileSync(envPath, 'utf8').split('\n');
+
+  const updatedLines = envLines.map(line => {
+    const [key] = line.split('=');
+    if (updates[key] !== undefined) {
+      return `${key}=${updates[key]}`;
+    }
+    return line;
+  });
+
+  // Add missing keys if not present
+  Object.entries(updates).forEach(([key, val]) => {
+    if (!envLines.some(line => line.startsWith(key + '='))) {
+      updatedLines.push(`${key}=${val}`);
+    }
+  });
+
+  fs.writeFileSync(envPath, updatedLines.join('\n'), 'utf8');
+}
+
+// --- Ensure token is valid before connection ---
+
+async function ensureValidToken() {
+  const expiresAt = Number(CTRADER_TOKEN_EXPIRES_AT) || 0;
+  if (!CTRADER_ACCESS_TOKEN || Date.now() > expiresAt) {
+    console.log('⏳ Access token missing or expired, refreshing...');
+    await refreshAccessToken();
+  } else {
+    console.log('✅ Access token valid.');
+  }
+}
+
+// --- Sending protobuf messages ---
+
+function sendMessage(socket, typeName, payload) {
+  const messageType = MessageTypes[typeName];
+  if (!messageType) {
+    console.error(`❌ Unknown message type: ${typeName}`);
+    return;
+  }
+  const payloadType = payloadTypeMap[typeName];
+  if (!payloadType) {
+    console.error(`❌ Unknown payload type for: ${typeName}`);
+    return;
+  }
+
+  const message = messageType.create(payload);
+  const messageBuffer = messageType.encode(message).finish();
+
+  const wrapper = OpenApiMessages.StreamingMessage.create({
+    payloadType,
+    payload: messageBuffer,
+  });
+  const wrapperBuffer = OpenApiMessages.StreamingMessage.encode(wrapper).finish();
+
+  const lengthBuffer = Buffer.alloc(4);
+  lengthBuffer.writeUInt32BE(wrapperBuffer.length, 0);
+
+  socket.write(lengthBuffer);
+  socket.write(wrapperBuffer);
+}
+
+// --- CSV export ---
+
+const exportFile = path.resolve(process.cwd(), 'ctrader-ticks.csv');
+const header = 'timestamp,instrument,ask,bid,midpoint\n';
+if (!fs.existsSync(exportFile)) {
+  fs.writeFileSync(exportFile, header, 'utf8');
+}
+
+function exportPriceToCsv(timestamp, instrument, ask, bid, midpoint) {
+  const csvLine = `${new Date(timestamp).toISOString()},${instrument},${ask},${bid},${midpoint}\n`;
+  fs.appendFile(exportFile, csvLine, err => {
+    if (err) console.error('❌ Failed to write CSV:', err.message);
+  });
+}
+
+// --- Main live feed connection and flow ---
+
+async function startLiveFeed() {
+  await ensureValidToken();
+
+  const socket = net.connect(5035, 'live.ctraderapi.com');
+
+  socket.on('connect', () => {
+    console.log('🟢 Connected to cTrader live API.');
+
+    // Handshake message
+    socket.write(Buffer.from([0x1]));
+
+    // Create session
+    sendMessage(socket, 'StreamingCreateSessionRequest', {
+      applicationName: 'MyAwesomeTraderBot',
+      applicationVersion: '1.0.0',
+      accountId: parseInt(CTRADER_ACCOUNT_ID, 10),
+    });
+
+    // Authenticate
+    sendMessage(socket, 'AuthenticateRequest', {
+      accessToken: CTRADER_ACCESS_TOKEN,
+    });
+  });
+
+  socket.on('data', (data) => {
+    try {
+      // Data chunk reading with 4-byte length prefix
+      let offset = 0;
+      while (offset < data.length) {
+        const length = data.readUInt32BE(offset);
+        offset += 4;
+        const msgBuffer = data.slice(offset, offset + length);
+        offset += length;
+
+        const streamingMessage = OpenApiMessages.StreamingMessage.decode(msgBuffer);
+
+        switch (streamingMessage.payloadType) {
+          case PayloadType.StreamingSessionStatusNotification: {
+            const status = OpenApiMessages.StreamingSessionStatusNotification.decode(streamingMessage.payload);
+            console.log(`🔔 Session status: ${status.status}`);
+
+            if (status.status === 'AuthenticationFailed') {
+              console.warn('⚠️ Authentication failed, refreshing token and reconnecting...');
+              socket.destroy();
+              refreshAccessToken().then(startLiveFeed).catch(err => {
+                console.error('❌ Failed to refresh token on auth failure:', err);
+                process.exit(1);
+              });
+            }
+
+            if (status.status === 'Authenticated') {
+              // Subscribe to market data for BTC/USD as example
+              sendMessage(socket, 'SubscriptionStreamingMarketDataRequest', {
+                subscription: {
+                  type: OpenApiCommonModelMessages.StreamingMarketDataSubscriptionType.Instrument,
+                  instrumentIds: [35], // Use actual instrument ID(s) as needed
+                },
+              });
+            }
+            break;
+          }
+          case PayloadType.StreamingMarketDataSnapshot:
+          case PayloadType.StreamingMarketDataUpdate: {
+            const marketData = OpenApiMessages.StreamingMarketData.decode(streamingMessage.payload);
+            const { timestamp, instrumentId, askPrice, bidPrice } = marketData;
+
+            const midpoint = ((askPrice || 0) + (bidPrice || 0)) / 2;
+
+            // Log minimally
+            process.stdout.write(`\r🟡 Price update ${instrumentId}: Ask ${askPrice} Bid ${bidPrice} Mid ${midpoint.toFixed(5)} `);
+
+            exportPriceToCsv(timestamp, instrumentId, askPrice, bidPrice, midpoint);
+            break;
+          }
+          default:
+            // Suppress unknown payloads in production
+            break;
+        }
+      }
+    } catch (err) {
+      console.error('❌ Failed to process incoming data:', err);
+    }
+  });
+
+  socket.on('close', () => {
+    console.warn('🔴 Connection closed, reconnecting in 5s...');
+    setTimeout(startLiveFeed, 5000);
+  });
+
+  socket.on('error', (err) => {
+    console.error('❌ Socket error:', err.message);
+    socket.destroy();
+  });
+}
+
+// --- Prompt input for user commands (optional) ---
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+});
+
+rl.on('line', (line) => {
+  const cmd = line.trim().toLowerCase();
+  if (cmd === 'exit' || cmd === 'quit') {
+    console.log('👋 Exiting...');
+    process.exit(0);
+  }
+  // Add further interactive commands as needed
+});
+
+// --- Start live feed ---
+
+startLiveFeed().catch(err => {
+  console.error('❌ Failed to start live feed:', err);
+});
+
+// Key points in this refactor:
+// Token management: refreshAccessToken() updates .env and tracks expiry with a 1-minute safety buffer.
+
+// Connection flow: startLiveFeed() calls ensureValidToken(), then connects, handshake, session create, and authenticates.
+
+// Reconnect: On auth failure, refresh token and reconnect automatically. On socket close, reconnect after 5 seconds.
+
+// Logging: Minimal logs for connection state, token refresh, session status, and concise price updates.
+
+// CSV export: Appends ticks with ISO timestamps.
+
+// User prompt: Basic quit command handled; extend as needed.

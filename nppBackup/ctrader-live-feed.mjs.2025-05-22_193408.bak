@@ -1,0 +1,249 @@
+import tls from 'tls';
+import fs from 'fs';
+import path from 'path';
+import dotenv from 'dotenv';
+import fetch from 'node-fetch';
+import readline from 'readline';
+import protobuf from 'protobufjs';
+import { fileURLToPath } from 'url';
+import process from 'process';
+
+dotenv.config();
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const protoDir = path.join(__dirname, 'protos');
+const envPath = path.join(__dirname, '.env');
+const OAUTH_URL = 'https://connect.spotware.com/apps/token';
+
+let {
+  CTRADER_CLIENT_ID,
+  CTRADER_CLIENT_SECRET,
+  CTRADER_ACCESS_TOKEN,
+  CTRADER_REFRESH_TOKEN,
+  CTRADER_ACCOUNT_ID
+} = process.env;
+
+const CLI_SYMBOL = process.argv.includes('--symbol')
+  ? process.argv[process.argv.indexOf('--symbol') + 1]?.toUpperCase()
+  : null;
+
+process.on('SIGINT', () => {
+  console.log('\n🛑 Graceful shutdown triggered. Exiting...');
+  process.exit();
+});
+
+process.on('unhandledRejection', err => {
+  console.error('❌ Unhandled rejection:', err);
+  process.exit(1);
+});
+
+// ✅ Update .env file safely with comment preservation
+function updateEnv(newValues) {
+  const originalLines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
+  const keysToUpdate = Object.keys(newValues);
+  const updatedLines = originalLines.map(line => {
+    const match = line.match(/^([^=]+)=.*/);
+    if (match && keysToUpdate.includes(match[1])) {
+      return `${match[1]}=${newValues[match[1]]}`;
+    }
+    return line;
+  });
+  fs.writeFileSync(envPath, updatedLines.join('\n'), 'utf8');
+}
+
+// ✅ Token refresh with exponential backoff retry
+async function refreshAccessToken(maxRetries = 5) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(OAUTH_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          client_id: CTRADER_CLIENT_ID,
+          client_secret: CTRADER_CLIENT_SECRET,
+          refresh_token: CTRADER_REFRESH_TOKEN
+        })
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      const data = await res.json();
+
+      updateEnv({
+        CTRADER_ACCESS_TOKEN: data.access_token,
+        CTRADER_REFRESH_TOKEN: data.refresh_token
+      });
+
+      CTRADER_ACCESS_TOKEN = data.access_token;
+      CTRADER_REFRESH_TOKEN = data.refresh_token;
+
+      console.log('🔐 Access token refreshed successfully.');
+      return;
+    } catch (err) {
+      const delay = Math.min(5000 * attempt, 30000);
+      console.warn(`⚠️ Token refresh failed (attempt ${attempt}): ${err.message}`);
+      if (attempt === maxRetries) throw new Error('❌ Max retries exceeded for token refresh');
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
+
+async function promptSymbol() {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise(resolve => {
+    rl.question('📝 Enter symbol to subscribe (e.g. EURUSD): ', answer => {
+      rl.close();
+      resolve(answer.trim().toUpperCase());
+    });
+  });
+}
+
+async function startStream() {
+  const root = await protobuf.load([
+    'OpenApiCommonMessages.proto',
+    'OpenApiCommonModelMessages.proto',
+    'OpenApiMessages.proto',
+    'OpenApiModelMessages.proto'
+  ].map(file => path.join(protoDir, file)));
+
+  const ProtoMessage = root.lookupType('ProtoMessage');
+  const PayloadType = root.lookupEnum('ProtoOAPayloadType');
+
+  const Messages = {
+    VersionReq: root.lookupType('ProtoOAVersionReq'),
+    AppAuthReq: root.lookupType('ProtoOAApplicationAuthReq'),
+    AccountAuthReq: root.lookupType('ProtoOAAccountAuthReq'),
+    SymbolsListReq: root.lookupType('ProtoOASymbolsListReq'),
+    SubscribeSpotsReq: root.lookupType('ProtoOASubscribeSpotsReq'),
+    SpotEvent: root.lookupType('ProtoOASpotEvent'),
+    ErrorRes: root.lookupType('ProtoOAErrorRes'),
+    SymbolsListRes: root.lookupType('ProtoOASymbolsListRes')
+  };
+
+  const PayloadMap = {
+    VersionReq: PayloadType.values.PROTO_OA_VERSION_REQ,
+    AppAuthReq: PayloadType.values.PROTO_OA_APPLICATION_AUTH_REQ,
+    AccountAuthReq: PayloadType.values.PROTO_OA_ACCOUNT_AUTH_REQ,
+    SymbolsListReq: PayloadType.values.PROTO_OA_SYMBOLS_LIST_REQ,
+    SubscribeSpotsReq: PayloadType.values.PROTO_OA_SUBSCRIBE_SPOTS_REQ
+  };
+
+  let socket;
+  let buffer = Buffer.alloc(0);
+  let symbols = [];
+
+  const send = (typeName, payload) => {
+    const type = Messages[typeName];
+    const message = type.create(payload);
+    const messageBuf = type.encode(message).finish();
+    const wrapper = ProtoMessage.create({ payloadType: PayloadMap[typeName], payload: messageBuf });
+    const wrapperBuf = ProtoMessage.encode(wrapper).finish();
+    const lengthBuf = Buffer.alloc(4);
+    lengthBuf.writeUInt32BE(wrapperBuf.length, 0);
+    socket.write(lengthBuf);
+    socket.write(wrapperBuf);
+    console.log(`→ Sent ${typeName}`);
+  };
+
+  const subscribe = (symbolName) => {
+    const match = symbols.find(s => s.symbolName.toUpperCase() === symbolName);
+    if (!match) {
+      console.error(`❌ Symbol not found: ${symbolName}`);
+      return;
+    }
+    send('SubscribeSpotsReq', {
+      ctidTraderAccountId: parseInt(CTRADER_ACCOUNT_ID),
+      symbolId: [match.symbolId]
+    });
+    console.log(`📡 Subscribed to ${symbolName} (${match.symbolId})`);
+  };
+
+  const connect = () => {
+    socket = tls.connect({ host: 'live.ctraderapi.com', port: 5035, servername: 'live.ctraderapi.com' });
+
+    socket.on('connect', () => {
+      console.log('🔗 Connected to cTrader API');
+      send('VersionReq', { version: { major: 2, minor: 0, patch: 0 } });
+    });
+
+    socket.on('data', chunk => {
+      buffer = Buffer.concat([buffer, chunk]);
+      while (buffer.length >= 4) {
+        const msgLen = buffer.readUInt32BE(0);
+        if (buffer.length < 4 + msgLen) break;
+
+        const msg = ProtoMessage.decode(buffer.slice(4, 4 + msgLen));
+        buffer = buffer.slice(4 + msgLen);
+        const pt = msg.payloadType;
+
+        const decode = (type, buf = msg.payload) => Messages[type].decode(buf);
+
+        switch (pt) {
+          case PayloadType.values.PROTO_OA_VERSION_RES:
+            send('AppAuthReq', { clientId: CTRADER_CLIENT_ID, clientSecret: CTRADER_CLIENT_SECRET });
+            break;
+
+          case PayloadType.values.PROTO_OA_APPLICATION_AUTH_RES:
+            send('AccountAuthReq', {
+              ctidTraderAccountId: parseInt(CTRADER_ACCOUNT_ID),
+              accessToken: CTRADER_ACCESS_TOKEN
+            });
+            break;
+
+          case PayloadType.values.PROTO_OA_ACCOUNT_AUTH_RES:
+            send('SymbolsListReq', { ctidTraderAccountId: parseInt(CTRADER_ACCOUNT_ID) });
+            break;
+
+			case PayloadType.values.PROTO_OA_SYMBOLS_LIST_RES: {
+			  const res = decode('SymbolsListRes');
+			  symbols = res.symbol;
+			  fs.writeFileSync(
+				path.join(__dirname, 'symbols.csv'),
+				'symbolId,symbolName\n' + symbols.map(s => `${s.symbolId},${s.symbolName}`).join('\n'),
+				'utf8'
+			  );
+			  console.log(`📥 Loaded ${symbols.length} symbols (saved to symbols.csv)`);
+
+			  (async () => {
+				const symbolToUse = CLI_SYMBOL || await promptSymbol();
+				subscribe(symbolToUse);
+			  })();
+			  break;
+
+          }
+
+          case PayloadType.values.PROTO_OA_SPOT_EVENT: {
+            const spot = decode('SpotEvent');
+            const name = symbols.find(s => s.symbolId === spot.symbolId)?.symbolName || `#${spot.symbolId}`;
+            const bid = (spot.bid / 100000).toFixed(5);
+            const ask = (spot.ask / 100000).toFixed(5);
+            console.log(`💹 ${name} | Bid: ${bid} | Ask: ${ask}`);
+            break;
+          }
+
+          case PayloadType.values.PROTO_OA_ERROR_RES:
+            const err = decode('ErrorRes');
+            console.error(`❌ API Error [${err.errorCode}]: ${err.description}`);
+            break;
+
+          default:
+            console.log(`⚠️ Unknown message type: ${pt}`);
+        }
+      }
+    });
+
+    socket.on('close', () => {
+      console.warn('🔌 Connection closed. Reconnecting in 5s...');
+      setTimeout(connect, 5000);
+    });
+
+    socket.on('error', err => {
+      console.error('❗ Socket error:', err.message);
+    });
+  };
+
+  connect();
+}
+
+await refreshAccessToken();
+await startStream();

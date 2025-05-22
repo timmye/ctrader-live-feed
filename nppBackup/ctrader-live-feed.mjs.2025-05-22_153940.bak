@@ -1,0 +1,169 @@
+import * as net from 'net';
+import * as fs from 'fs';
+import * as path from 'path';
+import dotenv from 'dotenv';
+import protobuf from 'protobufjs';
+import { fileURLToPath } from 'url';
+
+// Load environment variables
+dotenv.config();
+
+// Determine the current directory
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Paths to proto files
+const PROTO_PATHS = [
+  path.join(__dirname, 'protos/OpenApiCommonMessages.proto'),
+  path.join(__dirname, 'protos/OpenApiMessages.proto'),
+  path.join(__dirname, 'protos/OpenApiModelMessages.proto')
+];
+
+// Load protobuf definitions
+const root = await protobuf.load(PROTO_PATHS);
+
+// Define message types
+const MessageTypes = {
+  ProtoOAVersionReq: root.lookupType('ProtoOAVersionReq'),
+  ProtoOAApplicationAuthReq: root.lookupType('ProtoOAApplicationAuthReq'),
+  ProtoOAGetAccountListByAccessTokenReq: root.lookupType('ProtoOAGetAccountListByAccessTokenReq'), // ✅ correct
+  ProtoOAAccountAuthReq: root.lookupType('ProtoOAAccountAuthReq'),
+  ProtoOASubscribeSpotsReq: root.lookupType('ProtoOASubscribeSpotsReq'),
+  ProtoOAGetAccountListByAccessTokenRes: root.lookupType('ProtoOAGetAccountListByAccessTokenRes'),
+  ProtoOAAccountAuthRes: root.lookupType('ProtoOAAccountAuthRes'),
+  ProtoOASubscribeSpotsRes: root.lookupType('ProtoOASubscribeSpotsRes'),
+  ProtoOASpotEvent: root.lookupType('ProtoOASpotEvent'),
+  ProtoOAErrorRes: root.lookupType('ProtoOAErrorRes')
+};
+
+// Define payload type enumeration
+const PayloadTypeEnum = {
+  PROTO_OA_VERSION_REQ: 2100,
+  PROTO_OA_VERSION_RES: 2101,
+  PROTO_OA_APPLICATION_AUTH_REQ: 2102,
+  PROTO_OA_APPLICATION_AUTH_RES: 2103,
+  PROTO_OA_GET_ACCOUNT_LIST_BY_ACCESS_TOKEN_REQ: 2104,
+  PROTO_OA_GET_ACCOUNT_LIST_BY_ACCESS_TOKEN_RES: 2105,
+  PROTO_OA_ACCOUNT_AUTH_REQ: 2106,
+  PROTO_OA_ACCOUNT_AUTH_RES: 2107,
+  PROTO_OA_SUBSCRIBE_SPOTS_REQ: 2108,
+  PROTO_OA_SUBSCRIBE_SPOTS_RES: 2109,
+  PROTO_OA_SPOT_EVENT: 2110,
+  PROTO_OA_ERROR_RES: 2111
+};
+
+// Map message types to payload types
+const payloadTypeMap = {
+  ProtoOAVersionReq: PayloadTypeEnum.PROTO_OA_VERSION_REQ,
+  ProtoOAApplicationAuthReq: PayloadTypeEnum.PROTO_OA_APPLICATION_AUTH_REQ,
+  ProtoOAGetAccountListByAccessTokenReq: PayloadTypeEnum.PROTO_OA_GET_ACCOUNT_LIST_BY_ACCESS_TOKEN_REQ,
+  ProtoOAAccountAuthReq: PayloadTypeEnum.PROTO_OA_ACCOUNT_AUTH_REQ,
+  ProtoOASubscribeSpotsReq: PayloadTypeEnum.PROTO_OA_SUBSCRIBE_SPOTS_REQ
+};
+
+// cTrader host and port
+const CTRADER_HOST = 'live.ctraderapi.com';
+const CTRADER_PORT = 5035;
+
+// Environment variables
+const {
+  CTRADER_CLIENT_ID,
+  CTRADER_CLIENT_SECRET,
+  CTRADER_ACCESS_TOKEN
+} = process.env;
+
+// Helper function to send messages
+function sendMessage(socket, typeName, payload) {
+  const type = MessageTypes[typeName];
+  const payloadType = payloadTypeMap[typeName];
+  const errMsg = type.verify(payload);
+  if (errMsg) throw Error(errMsg);
+
+  const message = type.create(payload);
+  const buffer = type.encode(message).finish();
+
+  const header = Buffer.alloc(2);
+  header.writeUInt16BE(payloadType);
+
+  socket.write(Buffer.concat([header, buffer]));
+  console.log(`→ Sent ${typeName}`);
+}
+
+// Establish TCP connection
+const connection = net.connect({ host: CTRADER_HOST, port: CTRADER_PORT }, () => {
+  console.log('🔗 Connected to cTrader Open API');
+  sendMessage(connection, 'ProtoOAVersionReq', { version: '3.0' });
+});
+
+connection.on('data', (data) => {
+  const payloadType = data.readUInt16BE(0);
+  const payloadBuffer = data.slice(2);
+
+  switch (payloadType) {
+    case PayloadTypeEnum.PROTO_OA_VERSION_RES:
+      console.log('📡 Version handshake complete');
+      sendMessage(connection, 'ProtoOAApplicationAuthReq', {
+        clientId: CTRADER_CLIENT_ID,
+        clientSecret: CTRADER_CLIENT_SECRET
+      });
+      break;
+
+    case PayloadTypeEnum.PROTO_OA_APPLICATION_AUTH_RES:
+      console.log('✅ Application authenticated');
+      sendMessage(connection, 'ProtoOAGetAccountListByAccessTokenReq', {
+        accessToken: CTRADER_ACCESS_TOKEN
+      });
+      break;
+
+    case PayloadTypeEnum.PROTO_OA_GET_ACCOUNT_LIST_BY_ACCESS_TOKEN_RES: {
+      const accountList = MessageTypes.ProtoOAGetAccountListByAccessTokenRes.decode(payloadBuffer);
+      const accounts = accountList.ctidTraderAccount;
+
+      if (!accounts.length) {
+        console.error('❌ No trading accounts found for access token.');
+        process.exit(1);
+      }
+
+      const accountId = accounts[0].ctidTraderAccountId;
+      console.log(`📄 Found Account ID: ${accountId}`);
+
+      sendMessage(connection, 'ProtoOAAccountAuthReq', {
+        ctidTraderAccountId: accountId,
+        accessToken: CTRADER_ACCESS_TOKEN
+      });
+      break;
+    }
+
+    case PayloadTypeEnum.PROTO_OA_ACCOUNT_AUTH_RES:
+      console.log('🔐 Account authenticated');
+
+      // Example subscription (you can change symbolId to what you want)
+      sendMessage(connection, 'ProtoOASubscribeSpotsReq', {
+        ctidTraderAccountId: 0, // optional, can omit for global
+        symbolId: 1 // EURUSD
+      });
+      break;
+
+    case PayloadTypeEnum.PROTO_OA_SUBSCRIBE_SPOTS_RES:
+      console.log('📶 Spot subscription confirmed');
+      break;
+
+    case PayloadTypeEnum.PROTO_OA_SPOT_EVENT: {
+      const spot = MessageTypes.ProtoOASpotEvent.decode(payloadBuffer);
+      console.log(`💹 Spot Price: ${spot.symbolName} Bid: ${spot.bidPrice} Ask: ${spot.askPrice}`);
+      break;
+    }
+
+    case PayloadTypeEnum.PROTO_OA_ERROR_RES:
+      const error = MessageTypes.ProtoOAErrorRes.decode(payloadBuffer);
+      console.error(`❌ Error: ${error.errorCode} - ${error.description}`);
+      break;
+
+    default:
+      console.log(`📥 Unknown payloadType: ${payloadType}`);
+  }
+});
+
+connection.on('error', (err) => {
+  console.error('❌ Connection error:', err);
+});

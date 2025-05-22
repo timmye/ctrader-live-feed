@@ -1,0 +1,224 @@
+import tls from 'tls';
+import fs from 'fs';
+//import path from 'path';
+import dotenv from 'dotenv';
+import fetch from 'node-fetch';
+//import protobuf from 'protobufjs';
+///proto issue
+import { fileURLToPath } from 'url';
+import path from 'path';
+import protobuf from 'protobufjs';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ✅ Correct directory path to ./protos
+const protoDir = path.resolve(__dirname, 'protos');
+
+const root = await protobuf.load([
+  path.join(protoDir, 'OpenApiCommonMessages.proto'),
+  path.join(protoDir, 'OpenApiCommonModelMessages.proto'),
+  path.join(protoDir, 'OpenApiMessages.proto'),
+  path.join(protoDir, 'OpenApiModelMessages.proto')
+]);
+
+
+
+// Load environment variables
+dotenv.config();
+
+// Validate required environment variables
+const requiredEnvVars = [
+  'CTRADER_CLIENT_ID',
+  'CTRADER_CLIENT_SECRET',
+  'CTRADER_REDIRECT_URI',
+  'CTRADER_ACCESS_TOKEN',
+  'CTRADER_REFRESH_TOKEN',
+  'CTRADER_ACCOUNT_ID',
+];
+for (const varName of requiredEnvVars) {
+  if (!process.env[varName]) {
+    console.error(`Missing environment variable: ${varName}`);
+    process.exit(1);
+  }
+}
+
+// Destructure environment variables
+let {
+  CTRADER_CLIENT_ID,
+  CTRADER_CLIENT_SECRET,
+  CTRADER_REDIRECT_URI,
+  CTRADER_ACCESS_TOKEN,
+  CTRADER_REFRESH_TOKEN,
+  CTRADER_ACCOUNT_ID,
+} = process.env;
+
+// Load Protobuf definitions
+const protoRoot = await protobuf.load([
+  path.resolve('OpenApiCommonMessages.proto'),
+  path.resolve('OpenApiMessages.proto'),
+  path.resolve('OpenApiModelMessages.proto'),
+  path.resolve('OpenApiTradeMessages.proto'),
+]);
+
+// Define message types
+const ProtoOAVersionReq = protoRoot.lookupType('ProtoOAVersionReq');
+const ProtoOAVersionRes = protoRoot.lookupType('ProtoOAVersionRes');
+const ProtoOAApplicationAuthReq = protoRoot.lookupType('ProtoOAApplicationAuthReq');
+const ProtoOAApplicationAuthRes = protoRoot.lookupType('ProtoOAApplicationAuthRes');
+const ProtoOAAccountAuthReq = protoRoot.lookupType('ProtoOAAccountAuthReq');
+const ProtoOAAccountAuthRes = protoRoot.lookupType('ProtoOAAccountAuthRes');
+const ProtoOASubscribeSpotsReq = protoRoot.lookupType('ProtoOASubscribeSpotsReq');
+const ProtoOASpotEvent = protoRoot.lookupType('ProtoOASpotEvent');
+const ProtoOAErrorRes = protoRoot.lookupType('ProtoOAErrorRes');
+
+// Enum for payload types
+const ProtoPayloadType = protoRoot.lookupEnum('ProtoPayloadType');
+
+// Function to write updated tokens to .env file
+function updateEnvFile(newAccessToken, newRefreshToken) {
+  const envPath = path.resolve('.env');
+  let envContent = fs.readFileSync(envPath, 'utf-8');
+  envContent = envContent.replace(
+    /^CTRADER_ACCESS_TOKEN=.*$/m,
+    `CTRADER_ACCESS_TOKEN=${newAccessToken}`
+  );
+  envContent = envContent.replace(
+    /^CTRADER_REFRESH_TOKEN=.*$/m,
+    `CTRADER_REFRESH_TOKEN=${newRefreshToken}`
+  );
+  fs.writeFileSync(envPath, envContent);
+  console.log('✅ .env file updated with new tokens.');
+}
+
+// Function to refresh access token
+async function refreshAccessToken() {
+  const response = await fetch('https://connect.spotware.com/apps/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: CTRADER_REFRESH_TOKEN,
+      client_id: CTRADER_CLIENT_ID,
+      client_secret: CTRADER_CLIENT_SECRET,
+      redirect_uri: CTRADER_REDIRECT_URI,
+    }),
+  });
+
+  if (!response.ok) {
+    console.error('❌ Failed to refresh access token:', await response.text());
+    process.exit(1);
+  }
+
+  const data = await response.json();
+  CTRADER_ACCESS_TOKEN = data.access_token;
+  CTRADER_REFRESH_TOKEN = data.refresh_token;
+  updateEnvFile(CTRADER_ACCESS_TOKEN, CTRADER_REFRESH_TOKEN);
+}
+
+// Function to send a message over TLS
+function sendMessage(socket, messageType, messagePayload) {
+  const payloadType = ProtoPayloadType.values[messageType];
+  if (payloadType === undefined) {
+    throw new Error(`Unknown payload type: ${messageType}`);
+  }
+
+  const payloadBuffer = messagePayload.encode(messagePayload.create()).finish();
+  const header = Buffer.alloc(2);
+  header.writeUInt16BE(payloadType, 0);
+  const message = Buffer.concat([header, payloadBuffer]);
+  socket.write(message);
+}
+
+// Establish TLS connection
+function connect() {
+  const socket = tls.connect(
+    {
+      host: 'live.ctraderapi.com',
+      port: 5035,
+      servername: 'live.ctraderapi.com',
+    },
+    () => {
+      console.log('🔗 Connected to cTrader Open API');
+
+      // Send Version Request
+      sendMessage(socket, 'PROTO_OA_VERSION_REQ', ProtoOAVersionReq.create({ version: 1 }));
+
+      // Send Application Auth Request
+      sendMessage(
+        socket,
+        'PROTO_OA_APPLICATION_AUTH_REQ',
+        ProtoOAApplicationAuthReq.create({
+          clientId: CTRADER_CLIENT_ID,
+          clientSecret: CTRADER_CLIENT_SECRET,
+        })
+      );
+
+      // Send Account Auth Request
+      sendMessage(
+        socket,
+        'PROTO_OA_ACCOUNT_AUTH_REQ',
+        ProtoOAAccountAuthReq.create({
+          ctidTraderAccountId: parseInt(CTRADER_ACCOUNT_ID, 10),
+          accessToken: CTRADER_ACCESS_TOKEN,
+        })
+      );
+
+      // Subscribe to Spot Prices (example for EURUSD)
+      sendMessage(
+        socket,
+        'PROTO_OA_SUBSCRIBE_SPOTS_REQ',
+        ProtoOASubscribeSpotsReq.create({
+          ctidTraderAccountId: parseInt(CTRADER_ACCOUNT_ID, 10),
+          symbolId: EURUSD, // Replace with actual symbol ID
+        })
+      );
+    }
+  );
+
+  socket.on('data', (data) => {
+    const payloadType = data.readUInt16BE(0);
+    const payloadBuffer = data.slice(2);
+
+    switch (payloadType) {
+      case ProtoPayloadType.values.PROTO_OA_VERSION_RES:
+        const versionRes = ProtoOAVersionRes.decode(payloadBuffer);
+        console.log('📡 Version handshake complete:', versionRes);
+        break;
+      case ProtoPayloadType.values.PROTO_OA_APPLICATION_AUTH_RES:
+        const appAuthRes = ProtoOAApplicationAuthRes.decode(payloadBuffer);
+        console.log('✅ Application authenticated:', appAuthRes);
+        break;
+      case ProtoPayloadType.values.PROTO_OA_ACCOUNT_AUTH_RES:
+        const accountAuthRes = ProtoOAAccountAuthRes.decode(payloadBuffer);
+        console.log('✅ Account authenticated:', accountAuthRes);
+        break;
+      case ProtoPayloadType.values.PROTO_OA_SPOT_EVENT:
+        const spotEvent = ProtoOASpotEvent.decode(payloadBuffer);
+        console.log('💹 Spot Event:', spotEvent);
+        break;
+      case ProtoPayloadType.values.PROTO_OA_ERROR_RES:
+        const errorRes = ProtoOAErrorRes.decode(payloadBuffer);
+        console.error('❌ Error:', errorRes);
+        if (errorRes.errorCode === 'OA_AUTH_TOKEN_EXPIRED') {
+          console.log('🔄 Access token expired. Refreshing token...');
+          socket.end();
+          refreshAccessToken().then(connect);
+        }
+        break;
+      default:
+        console.warn('⚠️ Unknown payload type:', payloadType);
+    }
+  });
+
+  socket.on('error', (err) => {
+    console.error('❌ Socket error:', err);
+  });
+
+  socket.on('end', () => {
+    console.log('🔌 Disconnected from cTrader Open API');
+  });
+}
+
+// Start the connection
+connect();

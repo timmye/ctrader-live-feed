@@ -1,0 +1,147 @@
+// ─────────────────────────────────────────────────────────────
+// 1. Imports and Environment Setup
+// ─────────────────────────────────────────────────────────────
+import fs from 'fs';
+import path from 'path';
+import dotenv from 'dotenv';
+import grpc from '@grpc/grpc-js';
+import protoLoader from '@grpc/proto-loader';
+
+dotenv.config({ path: './.env' });
+
+const {
+  CTRADER_ACCESS_TOKEN,
+  CTRADER_ACCOUNT_ID,
+  CTRADER_CLIENT_ID,
+  CTRADER_CLIENT_SECRET
+} = process.env;
+
+const ENDPOINT = 'live.ctraderapi.com:5035';
+
+// ─────────────────────────────────────────────────────────────
+// 2. Load gRPC Proto Definitions
+// ─────────────────────────────────────────────────────────────
+const packageDefinition = protoLoader.loadSync(
+  [
+    './protos/OpenApiMessages.proto',
+    './protos/OpenApiCommonMessages.proto',
+    './protos/OpenApiCommonModelMessages.proto',
+    // './protos/OpenApiModelMessages.proto' // optional, only if needed
+  ],
+  {
+    keepCase: true,
+    longs: String,
+    enums: String,
+    defaults: true,
+    oneofs: true,
+  }
+);
+
+const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
+const OpenApi = protoDescriptor;
+
+// Debug proto load
+// console.dir(protoDescriptor, { depth: 3 });
+
+// ─────────────────────────────────────────────────────────────
+// 3. Create gRPC Client
+// ─────────────────────────────────────────────────────────────
+const client = new OpenApi.OpenApiService(
+  ENDPOINT,
+  grpc.credentials.createSsl()
+);
+
+// ─────────────────────────────────────────────────────────────
+// 4. Authenticate With Access Token
+// ─────────────────────────────────────────────────────────────
+function sendAuth() {
+  const request = {
+    accessToken: CTRADER_ACCESS_TOKEN
+  };
+
+  const command = {
+    payloadType: 'AUTH_REQ',
+    payload: OpenApi.AuthenticateRequest.encode(request).finish()
+  };
+
+  client.send(command, (err, response) => {
+    if (err) {
+      console.error('[Auth Error]', err.message);
+    } else {
+      const payload = OpenApi.AuthenticateResponse.decode(response.payload);
+      console.log('[Auth Success]', payload);
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// 5. Subscribe to Spot Ticks for a Symbol
+// ─────────────────────────────────────────────────────────────
+function subscribeToTicks(symbolId) {
+  const request = {
+    ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
+    symbolId: Number(symbolId)
+  };
+
+  const command = {
+    payloadType: 'SUBSCRIBE_SPOT_EVENT_REQ',
+    payload: OpenApi.SubscribeSpotEventRequest.encode(request).finish()
+  };
+
+  client.send(command, (err, response) => {
+    if (err) {
+      console.error('[Subscribe Error]', err.message);
+    } else {
+      const payload = OpenApi.SubscribeSpotEventResponse.decode(response.payload);
+      console.log('[Subscribed]', payload);
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// 6. Stream Spot Ticks via Bidirectional Subscription
+// ─────────────────────────────────────────────────────────────
+function handleStream() {
+  const stream = client.subscribe();
+
+  stream.on('data', (message) => {
+    switch (message.payloadType) {
+      case 'SPOT_EVENT':
+        const tick = OpenApi.SpotEvent.decode(message.payload);
+        console.log(`[Tick] Symbol ${tick.symbolName || tick.symbolId}: ${tick.bid} / ${tick.ask}`);
+        break;
+      default:
+        console.log('[Unhandled]', message.payloadType);
+        break;
+    }
+  });
+
+  stream.on('error', (err) => {
+    console.error('[Stream Error]', err.message);
+  });
+
+  stream.on('end', () => {
+    console.log('[Stream Ended]');
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// 7. Orchestrate Start-Up Sequence
+// ─────────────────────────────────────────────────────────────
+function start() {
+  sendAuth();
+  handleStream();
+
+  // Use a real symbolId from your account for actual prices
+  const defaultSymbolId = 1;
+
+  setTimeout(() => {
+    subscribeToTicks(defaultSymbolId);
+  }, 2000); // Slight delay to ensure auth completes
+}
+
+start();
+
+// ─────────────────────────────────────────────────────────────
+// EOF
+// ─────────────────────────────────────────────────────────────

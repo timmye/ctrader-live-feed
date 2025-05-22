@@ -1,0 +1,156 @@
+import net from 'net';
+import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
+import protobuf from 'protobufjs';
+
+dotenv.config();
+
+const {
+  CTRADER_ACCESS_TOKEN,
+  CTRADER_CLIENT_ID,
+  CTRADER_CLIENT_SECRET,
+  CTRADER_ACCOUNT_ID
+} = process.env;
+
+const CTRADER_HOST = 'live.ctraderapi.com';
+const CTRADER_PORT = 5035;
+
+const root = await protobuf.load([
+  './protos/OpenApiMessages.proto',
+  './protos/OpenApiCommonMessages.proto',
+  './protos/OpenApiCommonModelMessages.proto'
+]);
+
+const MessageTypes = {
+  ProtoOAVersionReq: root.lookupType('ProtoOAVersionReq'),
+  ProtoOAApplicationAuthReq: root.lookupType('ProtoOAApplicationAuthReq'),
+  ProtoOAAccountAuthReq: root.lookupType('ProtoOAAccountAuthReq'),
+  ProtoOASymbolsListReq: root.lookupType('ProtoOASymbolsListReq'),
+  ProtoOASubscribeSpotsReq: root.lookupType('ProtoOASubscribeSpotsReq'),
+  ProtoOASubscribeSpotsRes: root.lookupType('ProtoOASubscribeSpotsRes'),
+  ProtoOASpotEvent: root.lookupType('ProtoOASpotEvent'),
+  ProtoOASymbolsListRes: root.lookupType('ProtoOASymbolsListRes'),
+  ProtoOAErrorRes: root.lookupType('ProtoOAErrorRes')
+};
+
+const PayloadTypeEnum = {
+  PROTO_OA_VERSION_REQ: 2100,
+  PROTO_OA_VERSION_RES: 2101,
+  PROTO_OA_APPLICATION_AUTH_REQ: 2102,
+  PROTO_OA_APPLICATION_AUTH_RES: 2103,
+  PROTO_OA_ACCOUNT_AUTH_REQ: 2106,
+  PROTO_OA_ACCOUNT_AUTH_RES: 2107,
+  PROTO_OA_SYMBOLS_LIST_REQ: 2115,
+  PROTO_OA_SYMBOLS_LIST_RES: 2116,
+  PROTO_OA_SUBSCRIBE_SPOTS_REQ: 2108,
+  PROTO_OA_SUBSCRIBE_SPOTS_RES: 2109,
+  PROTO_OA_SPOT_EVENT: 2110,
+  PROTO_OA_ERROR_RES: 2111
+};
+
+const payloadTypeMap = {
+  ProtoOAVersionReq: PayloadTypeEnum.PROTO_OA_VERSION_REQ,
+  ProtoOAApplicationAuthReq: PayloadTypeEnum.PROTO_OA_APPLICATION_AUTH_REQ,
+  ProtoOAAccountAuthReq: PayloadTypeEnum.PROTO_OA_ACCOUNT_AUTH_REQ,
+  ProtoOASymbolsListReq: PayloadTypeEnum.PROTO_OA_SYMBOLS_LIST_REQ,
+  ProtoOASubscribeSpotsReq: PayloadTypeEnum.PROTO_OA_SUBSCRIBE_SPOTS_REQ
+};
+
+function sendMessage(socket, typeName, message) {
+  const MessageType = MessageTypes[typeName];
+  const payloadType = payloadTypeMap[typeName];
+  const errMsg = MessageType.verify(message);
+  if (errMsg) throw Error(errMsg);
+
+  const buffer = MessageType.encode(MessageType.create(message)).finish();
+  const header = Buffer.alloc(2);
+  header.writeUInt16BE(payloadType, 0);
+  socket.write(Buffer.concat([header, buffer]));
+
+  console.log(`→ Sent ${typeName}`);
+}
+
+let accountId = parseInt(CTRADER_ACCOUNT_ID);
+let eurusdSymbolId = null;
+
+const connection = net.connect({ host: CTRADER_HOST, port: CTRADER_PORT }, () => {
+  console.log('🔗 Connected to cTrader Open API');
+  sendMessage(connection, 'ProtoOAVersionReq', { version: '3.0' });
+});
+
+connection.on('data', (data) => {
+  const payloadType = data.readUInt16BE(0);
+  const payloadBuffer = data.slice(2);
+
+  switch (payloadType) {
+    case PayloadTypeEnum.PROTO_OA_VERSION_RES:
+      console.log('📡 Version handshake complete');
+      sendMessage(connection, 'ProtoOAApplicationAuthReq', {
+        clientId: CTRADER_CLIENT_ID,
+        clientSecret: CTRADER_CLIENT_SECRET
+      });
+      break;
+
+    case PayloadTypeEnum.PROTO_OA_APPLICATION_AUTH_RES:
+      console.log('✅ Application authenticated');
+      sendMessage(connection, 'ProtoOAAccountAuthReq', {
+        ctidTraderAccountId: accountId,
+        accessToken: CTRADER_ACCESS_TOKEN
+      });
+      break;
+
+    case PayloadTypeEnum.PROTO_OA_ACCOUNT_AUTH_RES:
+      console.log('🔐 Account authenticated');
+      sendMessage(connection, 'ProtoOASymbolsListReq', {
+        ctidTraderAccountId: accountId
+      });
+      break;
+
+    case PayloadTypeEnum.PROTO_OA_SYMBOLS_LIST_RES: {
+      const res = MessageTypes.ProtoOASymbolsListRes.decode(payloadBuffer);
+      const eurusd = res.symbol.find(sym => sym.symbolName === 'EURUSD');
+
+      if (!eurusd) {
+        console.error('❌ EURUSD not found in symbol list');
+        return connection.end();
+      }
+
+      eurusdSymbolId = eurusd.symbolId;
+      console.log(`✅ Found EURUSD with symbolId: ${eurusdSymbolId}`);
+
+      sendMessage(connection, 'ProtoOASubscribeSpotsReq', {
+        ctidTraderAccountId: accountId,
+        symbolId: eurusdSymbolId
+      });
+      break;
+    }
+
+    case PayloadTypeEnum.PROTO_OA_SUBSCRIBE_SPOTS_RES:
+      console.log('📶 Spot subscription confirmed');
+      break;
+
+    case PayloadTypeEnum.PROTO_OA_SPOT_EVENT: {
+      const tick = MessageTypes.ProtoOASpotEvent.decode(payloadBuffer);
+      console.log(`💹 Tick → ${tick.symbolName}: Bid ${tick.bidPrice}, Ask ${tick.askPrice}`);
+      break;
+    }
+
+    case PayloadTypeEnum.PROTO_OA_ERROR_RES: {
+      const error = MessageTypes.ProtoOAErrorRes.decode(payloadBuffer);
+      console.error(`❌ Error: ${error.errorCode} - ${error.description}`);
+      break;
+    }
+
+    default:
+      console.log(`ℹ️ Received message type ${payloadType}`);
+  }
+});
+
+connection.on('error', (err) => {
+  console.error('❌ Connection error:', err);
+});
+
+connection.on('end', () => {
+  console.log('🔒 Connection closed');
+});

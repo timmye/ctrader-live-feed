@@ -1,0 +1,159 @@
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// Load .env
+dotenv.config();
+
+// Get current file directory
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Paths to proto files
+const PROTO_PATH = {
+  OA: path.join(__dirname, 'protos/OpenApiMessages.proto'),
+  OACOMMON: path.join(__dirname, 'protos/OpenApiCommonMessages.proto'),
+  OACOMMONMODEL: path.join(__dirname, 'protos/OpenApiCommonModelMessages.proto')
+};
+
+// Load protobufs
+const packageDefinition = protoLoader.loadSync(Object.values(PROTO_PATH), {
+  keepCase: true,
+  longs: String,
+  enums: String,
+  defaults: true,
+  oneofs: true
+});
+const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
+const root = protoDescriptor.Spotware;
+
+const PayloadTypeEnum = root.PayloadTypeEnum;
+
+const MessageTypes = {
+  ProtoOAVersionReq: root.ProtoOAVersionReq,
+  ProtoOAApplicationAuthReq: root.ProtoOAApplicationAuthReq,
+  ProtoOAGetAccountListByAccessTokenReq: root.ProtoOAGetAccountListByAccessTokenReq,
+  ProtoOAGetAccountListByAccessTokenRes: root.ProtoOAGetAccountListByAccessTokenRes,
+  ProtoOAAccountAuthReq: root.ProtoOAAccountAuthReq,
+  ProtoOASubscribeSpotsReq: root.ProtoOASubscribeSpotsReq,
+  ProtoOASpotEvent: root.ProtoOASpotEvent,
+  ProtoOAErrorRes: root.ProtoOAErrorRes
+};
+
+const payloadTypeMap = {
+  ProtoOAVersionReq: PayloadTypeEnum.values.PROTO_OA_VERSION_REQ,
+  ProtoOAApplicationAuthReq: PayloadTypeEnum.values.PROTO_OA_APPLICATION_AUTH_REQ,
+  ProtoOAGetAccountListByAccessTokenReq: PayloadTypeEnum.values.PROTO_OA_GET_ACCOUNT_LIST_BY_ACCESS_TOKEN_REQ,
+  ProtoOAAccountAuthReq: PayloadTypeEnum.values.PROTO_OA_ACCOUNT_AUTH_REQ,
+  ProtoOASubscribeSpotsReq: PayloadTypeEnum.values.PROTO_OA_SUBSCRIBE_SPOTS_REQ
+};
+
+const CTRADER_HOST = 'live.ctraderapi.com:5035';
+const {
+  CTRADER_CLIENT_ID,
+  CTRADER_CLIENT_SECRET,
+  CTRADER_ACCESS_TOKEN
+} = process.env;
+
+// Helper to send messages
+function sendMessage(socket, typeName, payload) {
+  const type = MessageTypes[typeName];
+  const payloadType = payloadTypeMap[typeName];
+  const errMsg = type.verify(payload);
+  if (errMsg) throw Error(errMsg);
+
+  const message = type.create(payload);
+  const buffer = type.encode(message).finish();
+
+  const header = Buffer.alloc(2);
+  header.writeUInt16BE(payloadType);
+
+  socket.write(Buffer.concat([header, buffer]));
+  console.log(`→ Sent ${typeName}`);
+}
+
+// Start gRPC connection
+const socket = grpc.credentials.createSsl();
+const client = new grpc.Client(CTRADER_HOST, socket);
+
+// Raw TCP socket (lower level than client stubs)
+const net = await import('net');
+const connection = net.connect({ host: 'live.ctraderapi.com', port: 5035 }, () => {
+  console.log('🔗 Connected to cTrader Open API');
+  sendMessage(connection, 'ProtoOAVersionReq', { version: '3.0' });
+});
+
+connection.on('data', (data) => {
+  const payloadType = data.readUInt16BE(0);
+  const payloadBuffer = data.slice(2);
+
+  switch (payloadType) {
+    case PayloadTypeEnum.values.PROTO_OA_VERSION_RES:
+      console.log('📡 Version handshake complete');
+      sendMessage(connection, 'ProtoOAApplicationAuthReq', {
+        clientId: CTRADER_CLIENT_ID,
+        clientSecret: CTRADER_CLIENT_SECRET
+      });
+      break;
+
+    case PayloadTypeEnum.values.PROTO_OA_APPLICATION_AUTH_RES:
+      console.log('✅ Application authenticated');
+      sendMessage(connection, 'ProtoOAGetAccountListByAccessTokenReq', {
+        accessToken: CTRADER_ACCESS_TOKEN
+      });
+      break;
+
+    case PayloadTypeEnum.values.PROTO_OA_GET_ACCOUNT_LIST_BY_ACCESS_TOKEN_RES: {
+      const accountList = MessageTypes.ProtoOAGetAccountListByAccessTokenRes.decode(payloadBuffer);
+      const accounts = accountList.ctidTraderAccountList;
+
+      if (!accounts.length) {
+        console.error('❌ No trading accounts found for access token.');
+        process.exit(1);
+      }
+
+      const accountId = accounts[0].ctidTraderAccountId;
+      console.log(`📄 Found Account ID: ${accountId}`);
+
+      sendMessage(connection, 'ProtoOAAccountAuthReq', {
+        ctidTraderAccountId: accountId,
+        accessToken: CTRADER_ACCESS_TOKEN
+      });
+      break;
+    }
+
+    case PayloadTypeEnum.values.PROTO_OA_ACCOUNT_AUTH_RES:
+      console.log('🔐 Account authenticated');
+
+      // Example subscription (you can change symbolId to what you want)
+      sendMessage(connection, 'ProtoOASubscribeSpotsReq', {
+        ctidTraderAccountId: 0, // optional, can omit for global
+        symbolId: 1 // EURUSD
+      });
+      break;
+
+    case PayloadTypeEnum.values.PROTO_OA_SUBSCRIBE_SPOTS_RES:
+      console.log('📶 Spot subscription confirmed');
+      break;
+
+    case PayloadTypeEnum.values.PROTO_OA_SPOT_EVENT: {
+      const spot = MessageTypes.ProtoOASpotEvent.decode(payloadBuffer);
+      console.log(`💹 Spot Price: ${spot.symbolName} Bid: ${spot.bidPrice} Ask: ${spot.askPrice}`);
+      break;
+    }
+
+    case PayloadTypeEnum.values.PROTO_OA_ERROR_RES:
+      const error = MessageTypes.ProtoOAErrorRes.decode(payloadBuffer);
+      console.error(`❌ Error: ${error.errorCode} - ${error.description}`);
+      break;
+
+    default:
+      console.log(`📥 Unknown payloadType: ${payloadType}`);
+  }
+});
+
+connection.on('error', (err) => {
+  console.error('❌ Connection error:', err);
+});

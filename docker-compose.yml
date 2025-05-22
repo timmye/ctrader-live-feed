@@ -1,0 +1,9 @@
+version: '3'
+services:
+  ctrader-openapi:
+    image: spotware/connect-openapi:latest
+    container_name: ctrader_openapi
+    ports:
+      - "5030:5030" # HTTP Gateway
+      - "5031:5031" # WebSocket Gateway
+    restart: unless-stopped

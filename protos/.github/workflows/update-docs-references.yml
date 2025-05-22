@@ -1,0 +1,36 @@
+name: Build Docs
+
+on:
+  release:
+    types: [released]
+       
+env:
+  HELP_PORTAL_REPO_NAME: ctrader-help
+  
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - run: echo '${{ secrets.HELP_PORTAL_SSH_KEY }}' > HELP_PORTAL_KEY
+      - name: Setup SSH agent
+        env:
+          SSH_AUTH_SOCK: /tmp/ssh_agent.sock
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+ 
+          ssh-agent -a $SSH_AUTH_SOCK > /dev/null
+          chmod 0600 ./HELP_PORTAL_KEY
+          ssh-add ./HELP_PORTAL_KEY
+      - name: Checkout
+        env:
+          SSH_AUTH_SOCK: /tmp/ssh_agent.sock
+        run: git clone git@github.com:spotware/$HELP_PORTAL_REPO_NAME.git
+      - run: rm ./$HELP_PORTAL_REPO_NAME/open-api-docs/proto/*.proto
+      - run: mv *.proto ./$HELP_PORTAL_REPO_NAME/open-api-docs/proto
+      - name: Stage, commit, and push
+        env:
+          SSH_AUTH_SOCK: /tmp/ssh_agent.sock
+        working-directory: ${{env.HELP_PORTAL_REPO_NAME}}
+        run: git config user.name github-actions; git config user.email github-actions@github.com; git add -A ; git commit -m "Update Open API Proto Message Files" ; git push;

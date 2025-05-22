@@ -1,0 +1,175 @@
+import grpc from '@grpc/grpc-js';
+import protoLoader from '@grpc/proto-loader';
+
+const packageDefinition = protoLoader.loadSync(
+  [
+    './protos/OpenApiMessages.proto',
+    './protos/OpenApiCommonMessages.proto',
+    './protos/OpenApiCommonModelMessages.proto',
+    // Include only if confirmed compatible:
+    './protos/OpenApiModelMessages.proto'
+  ],
+  {
+    keepCase: true,
+    longs: String,
+    enums: String,
+    defaults: true,
+    oneofs: true,
+  }
+);
+
+const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
+
+// Print structure once to confirm
+console.dir(protoDescriptor, { depth: null });
+
+// Use your known working path
+const OpenApi = protoDescriptor;
+
+const client = new OpenApi.OpenApiService(
+  'live.ctraderapi.com:5035',
+  grpc.credentials.createSsl()
+);
+
+
+// === Load environment variables ===
+const {
+  CTRADER_ACCESS_TOKEN,
+  CTRADER_ACCOUNT_ID,
+} = process.env;
+
+if (!CTRADER_ACCESS_TOKEN || !CTRADER_ACCOUNT_ID) {
+  console.error('❌ Missing environment variables. Check .env file.');
+  process.exit(1);
+}
+
+const accountId = parseInt(CTRADER_ACCOUNT_ID);
+const PROTO_PATHS = [
+  './protos/OpenApiMessages.proto',
+  './protos/OpenApiCommonMessages.proto',
+  './protos/OpenApiCommonModelMessages.proto',
+  './protos/OpenApiModelMessages.proto',
+];
+
+// === Load gRPC Protobuf Definitions ===
+const packageDefinition = protoLoader.loadSync(PROTO_PATHS, {
+  keepCase: true,
+  longs: String,
+  enums: String,
+  defaults: true,
+  oneofs: true,
+});
+
+const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
+const OpenApi = protoDescriptor.OpenApi;
+
+// === Setup gRPC Client ===
+const client = new OpenApi.OpenApiService(
+  'live.ctraderapi.com:5035',
+  grpc.credentials.createSsl()
+);
+
+// === Helper: Send request ===
+function sendMessage(messageType, payload) {
+  return new Promise((resolve, reject) => {
+    client.process({ payloadType: messageType, payload: payload }, (err, response) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(response);
+      }
+    });
+  });
+}
+
+// === Authenticate Session ===
+async function authenticate() {
+  const authRequest = {
+    accessToken: CTRADER_ACCESS_TOKEN,
+  };
+
+  const response = await sendMessage('AUTH_REQ', {
+    authenticateRequest: authRequest,
+  });
+
+  if (response.payloadType !== 'AUTH_RES' || !response.authenticateResponse || response.authenticateResponse.accessToken !== CTRADER_ACCESS_TOKEN) {
+    throw new Error('❌ Authentication failed.');
+  }
+
+  console.log('✅ Authenticated with cTrader API.');
+}
+
+// === Subscribe to symbol prices ===
+async function subscribeToPrice(symbol) {
+  try {
+    const symbolReq = {
+      ctidTraderAccountId: accountId,
+      symbolName: symbol,
+    };
+
+    const symbolResponse = await sendMessage('SYMBOL_BY_NAME_REQ', {
+      symbolByNameRequest: symbolReq,
+    });
+
+    const symbolId = symbolResponse.symbolByNameResponse?.symbol?.symbolId;
+    if (!symbolId) throw new Error(`❌ Symbol ${symbol} not found.`);
+
+    const subscriptionReq = {
+      ctidTraderAccountId: accountId,
+      symbolId,
+    };
+
+    client.subscribePrice({
+      payloadType: 'SUBSCRIBE_SPOTS_REQ',
+      payload: {
+        subscribeSpotsRequest: subscriptionReq,
+      },
+    });
+
+    console.log(`📡 Subscribed to live prices for ${symbol} (ID: ${symbolId})`);
+
+    client.on('data', response => {
+      if (response.payloadType === 'SPOT_EVENT') {
+        const spot = response.spotEvent;
+        console.log(`[${new Date().toISOString()}] ${symbol} BID: ${spot.bidPrice / 100000} ASK: ${spot.askPrice / 100000}`);
+      }
+    });
+
+    client.on('error', err => {
+      console.error('❌ gRPC Stream Error:', err.message);
+    });
+
+    client.on('end', () => {
+      console.warn('ℹ️ gRPC Stream ended.');
+    });
+  } catch (err) {
+    console.error('❌ Failed to subscribe:', err.message);
+  }
+}
+
+// === Prompt for user symbol input ===
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+});
+
+function promptSymbol() {
+  rl.question('Enter a symbol to subscribe to live prices (e.g., EURUSD): ', symbol => {
+    if (!symbol.trim()) {
+      console.warn('⚠️ Please enter a valid symbol.');
+      return promptSymbol();
+    }
+    subscribeToPrice(symbol.toUpperCase());
+  });
+}
+
+// === Main ===
+(async () => {
+  try {
+    await authenticate();
+    promptSymbol();
+  } catch (err) {
+    console.error('❌ Error:', err.message);
+    process.exit(1);
+  }
+})();

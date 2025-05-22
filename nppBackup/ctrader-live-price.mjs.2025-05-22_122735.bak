@@ -1,0 +1,193 @@
+// ctrader-live-price.mjs
+import tls from 'tls';
+import fs from 'fs/promises';
+import path from 'path';
+import dotenv from 'dotenv';
+import fetch from 'node-fetch';
+import protobuf from 'protobufjs';
+import { fileURLToPath } from 'url';
+
+dotenv.config();
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PROTO_DIR = path.join(__dirname, 'protos');
+
+const {
+  CTRADER_CLIENT_ID,
+  CTRADER_CLIENT_SECRET,
+  CTRADER_REDIRECT_URI,
+  CTRADER_ACCESS_TOKEN,
+  CTRADER_REFRESH_TOKEN,
+  CTRADER_ACCOUNT_ID,
+} = process.env;
+
+if (!CTRADER_CLIENT_ID || !CTRADER_ACCESS_TOKEN || !CTRADER_ACCOUNT_ID) {
+  throw new Error('Missing credentials in .env');
+}
+
+const ENDPOINT = 'live.ctraderapi.com';
+const PORT = 5035;
+
+const protoFiles = [
+  'OpenApiMessages.proto',
+  'OpenApiCommonMessages.proto',
+  'OpenApiCommonModelMessages.proto',
+  'OpenApiModelMessages.proto',
+];
+
+const PAYLOAD_ENUM = {
+  ProtoOAVersionReq: 2104,
+  ProtoOAVersionRes: 2105,
+  ProtoOAApplicationAuthReq: 2100,
+  ProtoOAApplicationAuthRes: 2101,
+  ProtoOAAccountAuthReq: 2102,
+  ProtoOAAccountAuthRes: 2103,
+  ProtoOASubscribeSpotsReq: 1501,
+  ProtoOASpotEvent: 1504,
+};
+
+let root, socket;
+
+async function loadProtos() {
+  const rootBuilder = new protobuf.Root();
+  for (const file of protoFiles) {
+    const filePath = path.join(PROTO_DIR, file);
+    await rootBuilder.load(filePath, { keepCase: true });
+  }
+  rootBuilder.resolveAll();
+  return rootBuilder;
+}
+
+function getPayloadType(message) {
+  return PAYLOAD_ENUM[message.$type.name] ?? null;
+}
+
+function sendMessage(message) {
+  const payloadType = getPayloadType(message);
+  if (!payloadType) {
+    throw new Error(`No payloadType mapping for ${message.$type.name}`);
+  }
+  const wrapper = root.lookupType('proto.ProtoMessage');
+  const encodedPayload = message.constructor.encode(message).finish();
+  const envelope = wrapper.create({ payloadType, payload: encodedPayload });
+  const buffer = wrapper.encode(envelope).finish();
+  socket.write(buffer);
+  console.log(`→ Sent ${message.$type.name}`);
+}
+
+function handleMessage(buffer) {
+  const ProtoMessage = root.lookupType('proto.ProtoMessage');
+  const message = ProtoMessage.decode(buffer);
+  const type = Object.keys(PAYLOAD_ENUM).find(key => PAYLOAD_ENUM[key] === message.payloadType);
+  if (!type) {
+    console.warn(`❓ Unknown payloadType: ${message.payloadType}`);
+    return;
+  }
+  const MsgType = root.lookupType(`proto.${type}`);
+  const decoded = MsgType.decode(message.payload);
+  if (type === 'ProtoOASpotEvent') {
+    const { symbolId, bidPrice, askPrice } = decoded;
+    console.log(`💱 [${symbolId}] Bid: ${bidPrice} / Ask: ${askPrice}`);
+  } else if (type.endsWith('Res')) {
+    console.log(`← Received ${type}`);
+  }
+}
+
+async function refreshToken() {
+  console.log('🔁 Refreshing access token...');
+  const res = await fetch('https://oauth.ctrader.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: CTRADER_CLIENT_ID,
+      client_secret: CTRADER_CLIENT_SECRET,
+      refresh_token: CTRADER_REFRESH_TOKEN,
+      redirect_uri: CTRADER_REDIRECT_URI,
+    }),
+  });
+
+  const data = await res.json();
+  if (!data.access_token) throw new Error('Failed to refresh token');
+
+  const updatedEnv = Object.entries({
+    ...process.env,
+    CTRADER_ACCESS_TOKEN: data.access_token,
+    CTRADER_REFRESH_TOKEN: data.refresh_token,
+  })
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+
+  await fs.writeFile(path.join(__dirname, '.env'), updatedEnv);
+  console.log('✅ Token refreshed & .env updated. Please restart the script.');
+  process.exit(0);
+}
+
+async function main() {
+  root = await loadProtos();
+
+  socket = tls.connect(PORT, ENDPOINT, { rejectUnauthorized: false }, () => {
+    console.log('🔗 Connected to cTrader Open API');
+
+    const VersionReq = root.lookupType('proto.ProtoOAVersionReq');
+    sendMessage(VersionReq.create({ version: '1.0' }));
+
+    const AppAuthReq = root.lookupType('proto.ProtoOAApplicationAuthReq');
+    sendMessage(AppAuthReq.create({ clientId: CTRADER_CLIENT_ID, clientSecret: CTRADER_CLIENT_SECRET }));
+  });
+
+  let stage = 0;
+
+  socket.on('data', buffer => {
+    const ProtoMessage = root.lookupType('proto.ProtoMessage');
+    const { payloadType, payload } = ProtoMessage.decode(buffer);
+
+    const type = Object.keys(PAYLOAD_ENUM).find(k => PAYLOAD_ENUM[k] === payloadType);
+    if (!type) {
+      console.warn(`← Unknown payloadType: ${payloadType}`);
+      return;
+    }
+
+    const MsgType = root.lookupType(`proto.${type}`);
+    const message = MsgType.decode(payload);
+
+    if (type === 'ProtoOAVersionRes') {
+      console.log('📡 Version handshake complete');
+    }
+
+    if (type === 'ProtoOAApplicationAuthRes') {
+      console.log('✅ Application authenticated');
+
+      const AccountAuthReq = root.lookupType('proto.ProtoOAAccountAuthReq');
+      sendMessage(AccountAuthReq.create({ ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID), accessToken: CTRADER_ACCESS_TOKEN }));
+    }
+
+    if (type === 'ProtoOAAccountAuthRes') {
+      if (message.hasOwnProperty('errorCode')) {
+        console.error(`❌ Auth error: ${message.errorCode}`);
+        if (message.errorCode === 'CANT_ROUTE_REQUEST') {
+          console.warn('💡 Trying token refresh...');
+          refreshToken();
+        } else {
+          process.exit(1);
+        }
+      } else {
+        console.log('✅ Account authenticated');
+
+        const SubscribeReq = root.lookupType('proto.ProtoOASubscribeSpotsReq');
+        sendMessage(SubscribeReq.create({ ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID), symbolId: [1] })); // EURUSD usually ID 1
+      }
+    }
+
+    if (type === 'ProtoOASpotEvent') {
+      const { symbolId, bidPrice, askPrice } = message;
+      console.log(`💹 Tick: Symbol ${symbolId} → Bid: ${bidPrice}, Ask: ${askPrice}`);
+    }
+  });
+
+  socket.on('error', console.error);
+  socket.on('end', () => console.warn('🔌 Connection ended'));
+  socket.on('close', () => console.warn('🔒 Connection closed'));
+}
+
+main().catch(console.error);

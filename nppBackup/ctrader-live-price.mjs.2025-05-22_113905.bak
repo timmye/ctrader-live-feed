@@ -1,0 +1,153 @@
+// ctrader-live-price.mjs
+import tls from 'tls';
+import protobuf from 'protobufjs';
+import dotenv from 'dotenv';
+dotenv.config();
+
+const {
+  CTRADER_CLIENT_ID,
+  CTRADER_CLIENT_SECRET,
+  CTRADER_ACCESS_TOKEN,
+  SYMBOL_NAME  // e.g. "EURUSD"
+} = process.env;
+
+if (!CTRADER_CLIENT_ID || !CTRADER_CLIENT_SECRET || !CTRADER_ACCESS_TOKEN) {
+  console.error('❌ Missing CLIENT_ID, CLIENT_SECRET or ACCESS_TOKEN in .env');
+  process.exit(1);
+}
+
+(async () => {
+  const root = await protobuf.load([
+    './protos/OpenApiCommonMessages.proto',
+    './protos/OpenApiCommonModelMessages.proto',
+    './protos/OpenApiMessages.proto',
+    './protos/OpenApiModelMessages.proto'
+  ]);
+
+  const ProtoMessage       = root.lookupType('ProtoMessage');
+  const PayloadEnum        = root.lookupEnum('ProtoOAPayloadType');
+  const VersionReq         = root.lookupType('ProtoOAVersionReq');
+  const ApplicationAuthReq = root.lookupType('ProtoOAApplicationAuthReq');
+  const GetAccountsReq     = root.lookupType('ProtoOAGetAccountListByAccessTokenReq');
+  const GetAccountsRes     = root.lookupType('ProtoOAGetAccountListByAccessTokenRes');
+  const AccountAuthReq     = root.lookupType('ProtoOAAccountAuthReq');
+  const SubscribeSpotsReq  = root.lookupType('ProtoOASubscribeSpotsReq');
+  const SpotEventType      = root.lookupType('ProtoOASpotEvent');
+  const ErrorRes           = root.lookupType('ProtoOAErrorRes');
+
+  let versionAcked    = false;
+  let applicationSent = false;
+
+  function sendMessage(type, payload) {
+    const innerBuf = type.encode(type.create(payload)).finish();
+    const suffix   = type.name
+      .replace(/^ProtoOA/, '')
+      .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+      .toUpperCase();                     // e.g. APPLICATION_AUTH_REQ
+    const keys     = [`OA_${suffix}`, `PROTO_OA_${suffix}`];
+    const pt       = keys.reduce((v,k) => v ?? PayloadEnum.values[k], null);
+    if (pt == null) throw new Error(`Unknown payload enum for ${type.name}`);
+    console.log(`→ Sending ${type.name} (enum=${pt})`);
+    const wrapper = ProtoMessage.create({ payloadType: pt, payload: innerBuf });
+    const pkt     = ProtoMessage.encode(wrapper).finish();
+    const lenBuf  = Buffer.alloc(4);
+    lenBuf.writeUInt32BE(pkt.length);
+    socket.write(lenBuf);
+    socket.write(pkt);
+  }
+
+  let recvBuf = Buffer.alloc(0);
+
+  const socket = tls.connect(
+    { host: 'live.ctraderapi.com', port: 5035, servername: 'live.ctraderapi.com' },
+    () => {
+      console.log('🔗 Connected to cTrader Open API');
+      sendMessage(VersionReq, { version: { major: 1, minor: 0, patch: 0 } });
+    }
+  );
+
+  socket.on('data', chunk => {
+    recvBuf = Buffer.concat([recvBuf, chunk]);
+    while (recvBuf.length >= 4) {
+      const msgLen = recvBuf.readUInt32BE(0);
+      if (recvBuf.length < 4 + msgLen) break;
+      const msgBuf = recvBuf.slice(4, 4 + msgLen);
+      recvBuf       = recvBuf.slice(4 + msgLen);
+
+      const wrapper    = ProtoMessage.decode(msgBuf);
+      const rawEnum    = PayloadEnum.valuesById[wrapper.payloadType];
+      if (!rawEnum) continue;
+      const enumKey    = rawEnum.replace(/^PROTO_/, '').replace(/^OA_/, '');
+
+      switch (enumKey) {
+        case 'VERSION_RES':
+          if (!versionAcked) {
+            versionAcked = true;
+            console.log('📡 Version handshake complete');
+            if (!applicationSent) {
+              applicationSent = true;
+              sendMessage(ApplicationAuthReq, {
+                clientId:     CTRADER_CLIENT_ID,
+                clientSecret: CTRADER_CLIENT_SECRET
+              });
+            }
+          }
+          break;
+
+        case 'APPLICATION_AUTH_RES':
+          console.log('✅ Application Authenticated');
+          // → Always fetch account list
+          sendMessage(GetAccountsReq, { accessToken: CTRADER_ACCESS_TOKEN });
+          break;
+
+        case 'GET_ACCOUNT_LIST_BY_ACCESS_TOKEN_RES':
+          {
+            const ga     = GetAccountsRes.decode(wrapper.payload);
+            const acctId = ga.ctidTraderAccount[0].ctidTraderAccountId;
+            console.log('🆔 Fetched accountId:', acctId);
+            sendMessage(AccountAuthReq, {
+              ctidTraderAccountId: acctId,
+              accessToken:         CTRADER_ACCESS_TOKEN
+            });
+          }
+          break;
+
+        case 'ACCOUNT_AUTH_RES':
+          console.log('🔐 Account Authenticated');
+          sendMessage(SubscribeSpotsReq, {
+            ctidTraderAccountId: Number(
+              // sometimes appears in payload
+              (wrapper.payload.ctidTraderAccountId) || undefined
+            ),
+            accessToken: CTRADER_ACCESS_TOKEN,
+            symbolName:  SYMBOL_NAME || 'EURUSD'
+          });
+          break;
+
+        case 'SPOT_EVENT':
+          {
+            const spot = SpotEventType.decode(wrapper.payload);
+            console.log(`💹 ${spot.symbolName}  Bid=${spot.bidPrice}  Ask=${spot.askPrice}`);
+          }
+          break;
+
+        case 'ERROR_RES':
+          {
+            const err = ErrorRes.decode(wrapper.payload);
+            console.error('❌ Server Error:', err.errorCode, err.errorMessage);
+          }
+          break;
+      }
+    }
+  });
+
+  socket.on('error', err => {
+    console.error('⚠️ Socket error', err);
+    process.exit(1);
+  });
+
+  socket.on('close', () => {
+    console.log('🔒 Connection closed');
+    process.exit(0);
+  });
+})();

@@ -1,0 +1,177 @@
+// ctrader-live-price.mjs
+
+import tls from 'tls';
+import fs from 'fs';
+import path from 'path';
+import protobuf from 'protobufjs';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+// Load environment variables
+const {
+  CTRADER_CLIENT_ID,
+  CTRADER_CLIENT_SECRET,
+  CTRADER_ACCESS_TOKEN,
+  CTRADER_ACCOUNT_ID,
+  SYMBOL_NAME = 'EURUSD' // Default symbol if not specified
+} = process.env;
+
+// Validate required environment variables
+if (!CTRADER_CLIENT_ID || !CTRADER_CLIENT_SECRET || !CTRADER_ACCESS_TOKEN || !CTRADER_ACCOUNT_ID) {
+  console.error('❌ Missing required environment variables. Please ensure CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN, and CTRADER_ACCOUNT_ID are set in your .env file.');
+  process.exit(1);
+}
+
+// Define paths to .proto files
+const protoDir = path.resolve('./protos');
+const protoFiles = [
+  'OpenApiCommonMessages.proto',
+  'OpenApiCommonModelMessages.proto',
+  'OpenApiMessages.proto',
+  'OpenApiModelMessages.proto'
+];
+
+// Load and parse .proto files
+const root = await protobuf.load(protoFiles.map(file => path.join(protoDir, file)));
+
+// Lookup message types and enums
+const ProtoMessage = root.lookupType('ProtoMessage');
+const PayloadTypeEnum = root.lookupEnum('ProtoOAPayloadType');
+
+const MessageTypes = {
+  ProtoOAVersionReq: root.lookupType('ProtoOAVersionReq'),
+  ProtoOAApplicationAuthReq: root.lookupType('ProtoOAApplicationAuthReq'),
+  ProtoOAAccountAuthReq: root.lookupType('ProtoOAAccountAuthReq'),
+  ProtoOASubscribeSpotsReq: root.lookupType('ProtoOASubscribeSpotsReq'),
+  ProtoOAErrorRes: root.lookupType('ProtoOAErrorRes'),
+  ProtoOASpotEvent: root.lookupType('ProtoOASpotEvent')
+};
+
+// Map message type names to their corresponding payload type enums
+const payloadTypeMap = {
+  ProtoOAVersionReq: PayloadTypeEnum.values.PROTO_OA_VERSION_REQ,
+  ProtoOAApplicationAuthReq: PayloadTypeEnum.values.PROTO_OA_APPLICATION_AUTH_REQ,
+  ProtoOAAccountAuthReq: PayloadTypeEnum.values.PROTO_OA_ACCOUNT_AUTH_REQ,
+  ProtoOASubscribeSpotsReq: PayloadTypeEnum.values.PROTO_OA_SUBSCRIBE_SPOTS_REQ
+};
+
+// Function to send messages
+function sendMessage(socket, typeName, payload) {
+  const messageType = MessageTypes[typeName];
+  const payloadType = payloadTypeMap[typeName];
+
+  if (!messageType || payloadType === undefined) {
+    throw new Error(`Unsupported message type: ${typeName}`);
+  }
+
+  const message = messageType.create(payload);
+  const messageBuffer = messageType.encode(message).finish();
+
+  const wrapper = ProtoMessage.create({
+    payloadType,
+    payload: messageBuffer
+  });
+
+  const wrapperBuffer = ProtoMessage.encode(wrapper).finish();
+  const lengthBuffer = Buffer.alloc(4);
+  lengthBuffer.writeUInt32BE(wrapperBuffer.length, 0);
+
+  socket.write(lengthBuffer);
+  socket.write(wrapperBuffer);
+
+  console.log(`→ Sent ${typeName}`);
+}
+
+// Connect to cTrader Open API
+const socket = tls.connect(
+  {
+    host: 'live.ctraderapi.com',
+    port: 5035,
+    servername: 'live.ctraderapi.com'
+  },
+  () => {
+    console.log('🔗 Connected to cTrader Open API');
+    // Send version request
+    sendMessage(socket, 'ProtoOAVersionReq', {
+      version: { major: 2, minor: 0, patch: 0 }
+    });
+  }
+);
+
+// Buffer to accumulate incoming data
+let recvBuffer = Buffer.alloc(0);
+
+// Handle incoming data
+socket.on('data', chunk => {
+  recvBuffer = Buffer.concat([recvBuffer, chunk]);
+
+  while (recvBuffer.length >= 4) {
+    const messageLength = recvBuffer.readUInt32BE(0);
+    if (recvBuffer.length < 4 + messageLength) break;
+
+    const messageBuffer = recvBuffer.slice(4, 4 + messageLength);
+    recvBuffer = recvBuffer.slice(4 + messageLength);
+
+    const wrapper = ProtoMessage.decode(messageBuffer);
+    const payloadType = wrapper.payloadType;
+    const payloadBuffer = wrapper.payload;
+
+    switch (payloadType) {
+      case PayloadTypeEnum.values.PROTO_OA_VERSION_RES:
+        console.log('📡 Version handshake complete');
+        // Send application authentication request
+        sendMessage(socket, 'ProtoOAApplicationAuthReq', {
+          clientId: CTRADER_CLIENT_ID,
+          clientSecret: CTRADER_CLIENT_SECRET
+        });
+        break;
+
+      case PayloadTypeEnum.values.PROTO_OA_APPLICATION_AUTH_RES:
+        console.log('✅ Application authenticated');
+        // Send account authentication request
+        sendMessage(socket, 'ProtoOAAccountAuthReq', {
+          ctidTraderAccountId: parseInt(CTRADER_ACCOUNT_ID, 10),
+          accessToken: CTRADER_ACCESS_TOKEN
+        });
+        break;
+
+      case PayloadTypeEnum.values.PROTO_OA_ACCOUNT_AUTH_RES:
+        console.log('🔐 Account authenticated');
+        // Subscribe to spot prices
+        sendMessage(socket, 'ProtoOASubscribeSpotsReq', {
+          ctidTraderAccountId: parseInt(CTRADER_ACCOUNT_ID, 10),
+          symbolName: SYMBOL_NAME
+        });
+        break;
+
+      case PayloadTypeEnum.values.PROTO_OA_SPOT_EVENT:
+        const spotEvent = MessageTypes.ProtoOASpotEvent.decode(payloadBuffer);
+        const bid = spotEvent.bidPrice / Math.pow(10, spotEvent.pipsPrecision);
+        const ask = spotEvent.askPrice / Math.pow(10, spotEvent.pipsPrecision);
+        console.log(`💹 ${spotEvent.symbolName} | Bid: ${bid.toFixed(spotEvent.pipsPrecision)} | Ask: ${ask.toFixed(spotEvent.pipsPrecision)}`);
+        break;
+
+      case PayloadTypeEnum.values.PROTO_OA_ERROR_RES:
+        const errorRes = MessageTypes.ProtoOAErrorRes.decode(payloadBuffer);
+        console.error(`❌ Error: ${errorRes.errorCode} - ${errorRes.description}`);
+        break;
+
+      default:
+        console.log(`ℹ️ Received unhandled message with payload type: ${payloadType}`);
+        break;
+    }
+  }
+});
+
+// Handle socket errors
+socket.on('error', err => {
+  console.error('⚠️ Socket error:', err.message);
+  process.exit(1);
+});
+
+// Handle socket closure
+socket.on('close', () => {
+  console.log('🔒 Connection closed');
+  process.exit(0);
+});
